@@ -11,7 +11,7 @@ def create_test_msg(msg_size):
         _fields_ = [('data', ctypes.c_byte * msg_size)]
     return TEST
 
-def publisher_loop(pub_id=0, num_msgs=10000, msg_size=512, num_subscribers=1, ready_flag=None, server='localhost'):
+def publisher_loop(pub_id=0, num_msgs=10000, msg_size=512, num_subscribers=1, server='localhost'):
     # Setup Client
     connection = pika.BlockingConnection(
         pika.ConnectionParameters(host='localhost'))
@@ -19,16 +19,15 @@ def publisher_loop(pub_id=0, num_msgs=10000, msg_size=512, num_subscribers=1, re
 
     channel.exchange_declare(exchange='TEST', exchange_type='direct')
 
-    channel.exchange_declare(exchange='SUBSCRIBER_READY', exchange_type='fanout')
+    channel.exchange_declare(exchange='THREAD_STATUS', exchange_type='direct')
     result = channel.queue_declare(queue='', exclusive=True)
     sub_ready_queue_name = result.method.queue
     
     channel.queue_bind(
-        exchange='SUBSCRIBER_READY', queue=sub_ready_queue_name)
+        exchange='THREAD_STATUS', queue=sub_ready_queue_name, routing_key='SUBSCRIBER_READY')
 
     # Signal that publisher is ready
-    if ready_flag is not None:
-        ready_flag.set()
+    channel.basic_publish(exchange='THREAD_STATUS', routing_key='PUBLISHER_READY', body='')
 
     # Wait for the subscribers to be ready
     num_subscribers_ready = 0
@@ -54,6 +53,8 @@ def publisher_loop(pub_id=0, num_msgs=10000, msg_size=512, num_subscribers=1, re
         channel.basic_publish(exchange='TEST', routing_key='TEST_DATA', body=bytes(data.data))
     toc = time.perf_counter()
 
+    channel.basic_publish(exchange='THREAD_STATUS', routing_key='PUBLISHER_DONE', body='')
+
      # Stats
     test_msg_size = ctypes.sizeof(data) #HEADER_SIZE + ctypes.sizeof(data)
     dur = (toc-tic)
@@ -68,7 +69,7 @@ def subscriber_loop(sub_id, num_msgs, msg_size=512, server='localhost'):
         pika.ConnectionParameters(host='localhost'))
     channel = connection.channel()
     
-    channel.exchange_declare(exchange='SUBSCRIBER_READY', exchange_type='fanout')
+    channel.exchange_declare(exchange='THREAD_STATUS', exchange_type='direct')
     channel.exchange_declare(exchange='TEST', exchange_type='direct')
     channel.exchange_declare(exchange='EXIT', exchange_type='fanout')
     
@@ -83,19 +84,16 @@ def subscriber_loop(sub_id, num_msgs, msg_size=512, server='localhost'):
         exchange='EXIT', queue=exit_queue_name)
 
     # Send Subscriber Ready
-    channel.basic_publish(exchange='SUBSCRIBER_READY', routing_key='', body='')
+    channel.basic_publish(exchange='THREAD_STATUS', routing_key='SUBSCRIBER_READY', body='')
 
     # Read Loop (Start clock after first TEST msg received)
-    abort_timeout = max(num_msgs/10000, 10) #seconds
-    abort_start = time.perf_counter()
-
     msg_count = 0
     tic = time.perf_counter()
     toc = time.perf_counter()
 
     def exit_callback(channel, method, properties, body):
         print('Got EXIT')
-        channel.stop_consuming() # subscribers are ready
+        channel.stop_consuming() # test timeout
     def data_rcv_callback(channel, method, properties, body):
         nonlocal msg_count
         nonlocal tic
@@ -107,16 +105,13 @@ def subscriber_loop(sub_id, num_msgs, msg_size=512, server='localhost'):
         if msg_count >= num_msgs:
             channel.stop_consuming() # all messages received
 
-        if time.perf_counter() - abort_start > abort_timeout: 
-            print(f"Subscriber [{sub_id:d}] Timed out.")
-            channel.stop_consuming()
-
-
     channel.basic_consume(
         queue=test_data_queue_name, on_message_callback=data_rcv_callback, auto_ack=True)
     channel.basic_consume(
         queue=exit_queue_name, on_message_callback=exit_callback, auto_ack=True)
     channel.start_consuming() # read messages
+
+    channel.basic_publish(exchange='THREAD_STATUS', routing_key='SUBSCRIBER_DONE', body='')
 
     # Stats
     msg_data = create_test_msg(msg_size)()
@@ -130,6 +125,181 @@ def subscriber_loop(sub_id, num_msgs, msg_size=512, server='localhost'):
 
     connection.close()
 
+def heartbeat_loop(server='localhost'):
+    # Setup Client
+    connection = pika.BlockingConnection(
+        pika.ConnectionParameters(host='localhost'))
+    channel = connection.channel()
+
+    channel.exchange_declare(exchange='HEARTBEAT', exchange_type='fanout')
+    channel.exchange_declare(exchange='EXIT', exchange_type='fanout')
+    result = channel.queue_declare(queue='', exclusive=True)
+    exit_queue_name = result.method.queue
+    channel.queue_bind(
+        exchange='EXIT', queue=exit_queue_name)
+   
+    # Send loop
+    exit = False
+    while not exit:
+        method, properties, body = channel.basic_get(exit_queue_name, auto_ack = True)  
+        if method is not None:
+            print('Heartbeat thread got EXIT')
+            exit = True
+            break
+        channel.basic_publish(exchange='HEARTBEAT', routing_key='', body='')
+        time.sleep(1)
+    
+    connection.close()
+
+def main(args):
+    # Main Thread client
+    connection = pika.BlockingConnection(
+        pika.ConnectionParameters(host='localhost'))
+    channel = connection.channel()
+    channel.exchange_declare(exchange='EXIT', exchange_type='fanout')
+    channel.exchange_declare(exchange='THREAD_STATUS', exchange_type='direct')
+    channel.exchange_declare(exchange='HEARTBEAT', exchange_type='fanout')
+
+
+    result = channel.queue_declare(queue='', exclusive=True)
+    sub_ready_queue_name = result.method.queue
+    channel.queue_bind(
+        exchange='THREAD_STATUS', queue=sub_ready_queue_name, routing_key='SUBSCRIBER_READY')
+
+    result = channel.queue_declare(queue='', exclusive=True)
+    pub_ready_queue_name = result.method.queue
+    channel.queue_bind(
+        exchange='THREAD_STATUS', queue=pub_ready_queue_name, routing_key='PUBLISHER_READY')    
+
+    result = channel.queue_declare(queue='', exclusive=True)
+    sub_done_queue_name = result.method.queue
+    channel.queue_bind(
+        exchange='THREAD_STATUS', queue=sub_done_queue_name, routing_key='SUBSCRIBER_DONE')    
+
+    result = channel.queue_declare(queue='', exclusive=True)
+    pub_done_queue_name = result.method.queue
+    channel.queue_bind(
+        exchange='THREAD_STATUS', queue=pub_done_queue_name, routing_key='PUBLISHER_DONE')
+
+    result = channel.queue_declare(queue='', exclusive=True)
+    heartbeat_queue_name = result.method.queue
+    channel.queue_bind(
+        exchange='HEARTBEAT', queue=heartbeat_queue_name)
+
+    sys.stdout.write(f"Packet size: {args.msg_size} bytes\n")
+    sys.stdout.write(f'Sending {args.num_msgs} messages...\n')
+    sys.stdout.flush()
+
+    # initialize heartbeat thread
+    heartbeat_thread = multiprocessing.Process(
+                        target=heartbeat_loop,
+                        kwargs={'server': args.server})
+    heartbeat_thread.start()
+
+    #print("Initializing producer processses...")
+    publishers = []
+    for n in range(args.num_publishers):
+        publishers.append(
+                multiprocessing.Process(
+                    target=publisher_loop,
+                    kwargs={
+                        'pub_id': n+1,
+                        'num_msgs': int(args.num_msgs/args.num_publishers),
+                        'msg_size': args.msg_size, 
+                        'num_subscribers': args.num_subscribers,
+                        'server': args.server})
+                    )
+        publishers[n].start()
+
+    # Wait for publisher processes to be established
+    publishers_ready = 0
+
+    def pub_ready_callback(channel, method, properties, body):
+        nonlocal publishers_ready
+        publishers_ready += 1
+        if publishers_ready >= args.num_publishers:
+            channel.stop_consuming() # publishers are ready
+
+    if publishers_ready < args.num_publishers:
+        channel.basic_consume(
+            queue=pub_ready_queue_name, on_message_callback=pub_ready_callback, auto_ack=True)
+        channel.start_consuming() # wait for publishers to be ready
+        
+    #print('Waiting for subscriber processes...')
+    subscribers = []
+    for n in range(args.num_subscribers):
+        subscribers.append(
+                multiprocessing.Process(
+                    target=subscriber_loop,
+                    kwargs={
+                        'sub_id': n+1,
+                        'num_msgs': args.num_msgs,
+                        'msg_size': args.msg_size, 
+                        'server': args.server})
+                    )
+        subscribers[n].start()
+
+    #print("Starting Test...")
+    
+    # Wait for subscribers to finish
+    abort_timeout = 120 #seconds
+    abort_start = time.perf_counter()
+
+    subscribers_done = 0
+    publishers_done = 0
+
+    def sub_done_callback(channel, method, properties, body):
+        nonlocal subscribers_done
+        subscribers_done += 1
+        if (subscribers_done >= args.num_subscribers) and (publishers_done >= args.num_publishers):
+            channel.stop_consuming() # publishers and subscribers are done
+        elif (time.perf_counter() - abort_start) > abort_timeout: 
+            channel.basic_publish(exchange='EXIT', routing_key='', body='')
+            sys.stdout.write('Test Timeout! Sending Exit Signal...\n')
+            sys.stdout.flush()
+            channel.stop_consuming()
+
+    def pub_done_callback(channel, method, properties, body):
+        nonlocal publishers_done
+        publishers_done += 1
+        if (subscribers_done >= args.num_subscribers) and (publishers_done >= args.num_publishers):
+            channel.stop_consuming() # publishers and subscribers are done
+        elif (time.perf_counter() - abort_start) > abort_timeout: 
+            channel.basic_publish(exchange='EXIT', routing_key='', body='')
+            sys.stdout.write('Test Timeout! Sending Exit Signal...\n')
+            sys.stdout.flush()
+            channel.stop_consuming()
+    
+    def heartbeat_callback(channel, method, properties, body):
+        #sys.stdout.write(".")
+        #sys.stdout.flush()
+        if (time.perf_counter() - abort_start) > abort_timeout: 
+            channel.basic_publish(exchange='EXIT', routing_key='', body='')
+            sys.stdout.write('Test Timeout! Sending Exit Signal...\n')
+            sys.stdout.flush()
+            channel.stop_consuming()
+
+    if (subscribers_done < args.num_subscribers) or (publishers_done < args.num_publishers):
+        channel.basic_consume(
+            queue=sub_done_queue_name, on_message_callback=sub_done_callback, auto_ack=True)
+        channel.basic_consume(
+            queue=pub_done_queue_name, on_message_callback=pub_done_callback, auto_ack=True)
+        channel.basic_consume(
+            queue=heartbeat_queue_name, on_message_callback=heartbeat_callback, auto_ack=True)
+        channel.start_consuming() # wait for publishers and subscribers to be done
+
+    channel.basic_publish(exchange='EXIT', routing_key='', body='') # send exit to heartbeat thread
+
+    for publisher in publishers:
+        publisher.join()
+
+    for subscriber in subscribers:
+        subscriber.join()
+    
+    time.sleep(1) # wait for heartbeat thread to stop
+    heartbeat_thread.join()
+    
+    connection.close()
 
 if __name__ == '__main__':
     import argparse
@@ -143,75 +313,6 @@ if __name__ == '__main__':
     parser.add_argument('-s',default='localhost', dest='server', help='RabbitMQ message broker ip address (default: ''localhost'')')
     args = parser.parse_args()
 
-    # Main Thread client
-    connection = pika.BlockingConnection(
-        pika.ConnectionParameters(host='localhost'))
-    channel = connection.channel()
-    channel.exchange_declare(exchange='EXIT', exchange_type='fanout')
-    #channel.queue_declare(queue='', exclusive=True)
+    main(args)
 
-    print("Initializing producer processses...")
-    publisher_ready = []
-    publishers = []
-    for n in range(args.num_publishers):
-        publisher_ready.append(multiprocessing.Event())
-        publishers.append(
-                multiprocessing.Process(
-                    target=publisher_loop,
-                    kwargs={
-                        'pub_id': n+1,
-                        'num_msgs': int(args.num_msgs/args.num_publishers),
-                        'msg_size': args.msg_size, 
-                        'num_subscribers': args.num_subscribers,
-                        'ready_flag': publisher_ready[n],
-                        'server': args.server})
-                    )
-        publishers[n].start()
-
-    # Wait for publisher processes to be established
-    for flag in publisher_ready:
-        flag.wait()
-
-    print('Waiting for subscriber processes...')
-    subscribers = []
-    for n in range(args.num_subscribers):
-        subscribers.append(
-                multiprocessing.Process(
-                    target=subscriber_loop,
-                    args=(n+1, args.num_msgs, args.msg_size),
-                    kwargs={'server':args.server}))
-        subscribers[n].start()
-
-    print("Starting Test...")
-    #print(f"RabbitMQ packet size: {HEADER_SIZE + args.msg_size}")
-    print(f'Sending {args.num_msgs} messages...')
-
-    # Wait for publishers to finish
-    for publisher in publishers:
-        publisher.join()
-
-    # Wait for subscribers to finish
-    abort_timeout = max(args.num_msgs/10000, 10) #seconds
-    abort_start = time.perf_counter()
-    abort = False
-
-    while not abort:
-        subscribers_finished = 0
-        for subscriber in subscribers:
-            if subscriber.exitcode is not None:
-                subscribers_finished += 1
-
-        if subscribers_finished == len(subscribers):
-            break
-
-        if time.perf_counter() - abort_start > abort_timeout: 
-            channel.basic_publish(exchange='EXIT', routing_key='', body='')
-            print('Test Timeout! Sending Exit Signal...')
-            abort = True
-
-    for subscriber in subscribers:
-        subscriber.join()
-    
-    connection.close()
-
-    print('Done!')
+    #print('Done!')
