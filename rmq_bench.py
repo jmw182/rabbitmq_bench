@@ -57,7 +57,7 @@ def publisher_loop(pub_id=0, num_msgs=10000, msg_size=512, num_subscribers=1, re
      # Stats
     test_msg_size = ctypes.sizeof(data) #HEADER_SIZE + ctypes.sizeof(data)
     dur = (toc-tic)
-    data_rate = test_msg_size * num_msgs / float(1048576) / dur
+    data_rate = test_msg_size * num_msgs / 1e6 / dur
     print(f"Publisher[{pub_id}] -> {num_msgs} messages | {int((num_msgs)/dur)} messages/sec | {data_rate:0.1f} MB/sec | {dur:0.6f} sec ")    
     
     connection.close()
@@ -122,7 +122,7 @@ def subscriber_loop(sub_id, num_msgs, msg_size=512, server='localhost'):
     msg_data = create_test_msg(msg_size)()
     test_msg_size = ctypes.sizeof(msg_data)
     dur = toc - tic
-    data_rate = (test_msg_size * num_msgs) / float(1048576) / dur
+    data_rate = (test_msg_size * num_msgs) / 1e6 / dur
     if msg_count == num_msgs:
         print(f"Subscriber [{sub_id:d}] -> {msg_count} messages | {int((msg_count-1)/dur)} messages/sec | {data_rate:0.1f} MB/sec | {dur:0.6f} sec ")
     else:
